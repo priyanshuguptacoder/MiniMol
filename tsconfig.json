@@ -1,0 +1,26 @@
+// tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Node",
+    "jsx": "react-jsx",
+    "allowJs": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@shared/*": ["packages/shared/*"],
+      "@inference/*": ["packages/inference-engine/*"],
+      "@partition/*": ["packages/partition-engine/*"],
+      "@network/*": ["packages/networking/*"]
+    }
+  },
+  "include": ["apps/**/*", "packages/**/*", "tools/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

@@ -1,0 +1,32 @@
+{
+  "name": "splitinfer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "npm -w apps/web run dev",
+    "dev:web": "npm -w apps/web run dev",
+    "dev:server": "npm -w apps/signaling-server run dev",
+    "dev:all": "node scripts/start-all.js",
+    "build": "npm -w apps/web run build",
+    "typecheck": "npm -w apps/web run typecheck",
+    "lint": "npm -w apps/web run lint",
+    "test": "npm -w apps/web run test",
+    "test:integration:2dev": "node scripts/run-e2e-devices.js",
+    "test:integration:4dev": "node scripts/run-e2e-4devices.js",
+    "test:e2e": "echo 'E2E tests require playwright - see docs'",
+    "model:build": "cd tools/model-builder && python3 train_and_export.py"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "tools/*"
+  ],
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "@types/node": "^20",
+    "eslint": "^8",
+    "prettier": "^3"
+  }
+}

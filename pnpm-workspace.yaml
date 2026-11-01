@@ -1,0 +1,7 @@
+pnpm-workspace.yaml:
+  packages:
+    - 'apps/*'
+    - 'packages/*'
+    - 'tools/*'
+  skip-install:
+    - '**/__tests__/**'
