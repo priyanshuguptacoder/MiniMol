@@ -190,6 +190,8 @@ export class DistributedInference {
 
   // ─────────────────────────────────────────────────────────────────────────────
   // WORKER (Stage 1+) - runs until cancelled, processing one tensor per step
+  // The last device runs ALL remaining model stages up to stage 3 (logit head).
+  // e.g. 3 devices: device 2 (last) runs model stages 2 AND 3.
   // ─────────────────────────────────────────────────────────────────────────────
   private async runWorkerLoop(
     myStageIndex: number,
@@ -197,34 +199,43 @@ export class DistributedInference {
     devices: ReturnType<typeof useSessionStore.getState>['devices'],
     sessionStore: ReturnType<typeof useSessionStore.getState>
   ): Promise<void> {
-    // Ensure this stage's model is loaded
-    if (!isStageLoaded(myStageIndex)) {
-      console.log(`[DistributedInference] Stage ${myStageIndex}: model not loaded, loading now...`);
-      try {
-        const settings = useSettingsStore.getState();
-        const manifest = useModelStore.getState().manifest;
-        if (!manifest) throw new Error('Model manifest not loaded on this device. Please load the model first.');
+    const TOTAL_MODEL_STAGES = 4; // always 4 ONNX stage files: 0,1,2,3
+    const isLastStage = myStageIndex === (totalDevices - 1);
 
-        const baseUrl = settings.manifestUrl.substring(0, settings.manifestUrl.lastIndexOf('/') + 1);
-        const stageInfo = manifest.stages[myStageIndex];
-        if (!stageInfo) throw new Error(`No stage descriptor for stage ${myStageIndex}`);
+    // Determine which model stages this device must run:
+    //   - Non-last devices: just myStageIndex
+    //   - Last device: myStageIndex through TOTAL_MODEL_STAGES-1 (to get logits)
+    const stagesToRun: number[] = [];
+    if (isLastStage) {
+      for (let s = myStageIndex; s < TOTAL_MODEL_STAGES; s++) stagesToRun.push(s);
+    } else {
+      stagesToRun.push(myStageIndex);
+    }
 
+    // Load all required model stages
+    const settings = useSettingsStore.getState();
+    const manifest = useModelStore.getState().manifest;
+    if (!manifest) throw new Error('Model manifest not loaded on this device. Please load the model first.');
+
+    const baseUrl = settings.manifestUrl.substring(0, settings.manifestUrl.lastIndexOf('/') + 1);
+
+    for (const s of stagesToRun) {
+      if (!isStageLoaded(s)) {
+        console.log(`[DistributedInference] Stage ${myStageIndex} worker: loading model stage ${s}...`);
+        const stageInfo = manifest.stages[s];
+        if (!stageInfo) throw new Error(`No stage descriptor for model stage ${s}`);
         await loadStage(
           baseUrl + stageInfo.file,
-          myStageIndex,
+          s,
           stageInfo.inputName,
           stageInfo.outputName,
           settings.inferenceBackend
         );
-        console.log(`[DistributedInference] Stage ${myStageIndex}: model loaded successfully`);
-      } catch (err) {
-        console.error(`[DistributedInference] Stage ${myStageIndex}: failed to load model:`, err);
-        throw err;
+        console.log(`[DistributedInference] Model stage ${s} loaded`);
       }
     }
 
-    const isLastStage = myStageIndex === (totalDevices - 1);
-    console.log(`[DistributedInference] Stage ${myStageIndex} worker started (isLast=${isLastStage})`);
+    console.log(`[DistributedInference] Stage ${myStageIndex} worker started (isLast=${isLastStage}, model stages: ${stagesToRun.join(',')})`);
 
     // Process tokens indefinitely until cancelled
     while (!this.cancelled) {
@@ -234,14 +245,22 @@ export class DistributedInference {
         if (this.cancelled) break;
 
         const tStart = Date.now();
-        const output = await runStageAtIndex(myStageIndex, incoming, [1, 64, 64]);
+
+        // Run all assigned model stages sequentially
+        let activation: Float32Array = incoming;
+        for (const s of stagesToRun) {
+          // Stage 0 uses int64 token input (handled by host), intermediate stages use [1,64,64]
+          const inputShape = [1, 64, 64];
+          activation = await runStageAtIndex(s, activation, inputShape);
+        }
+
         const duration = Date.now() - tStart;
-        console.log(`[DistributedInference] Stage ${myStageIndex}: processed tensor in ${duration}ms`);
+        console.log(`[DistributedInference] Stage ${myStageIndex}: processed model stages ${stagesToRun.join(',')} in ${duration}ms`);
 
         if (isLastStage) {
-          // Sample token from output logits
+          // activation is now logits [1, 64, 96] from stage 3
           const inferStore = useInferenceStore.getState();
-          const lastLogits = output.subarray((64 - 1) * 96, 64 * 96);
+          const lastLogits = activation.subarray((64 - 1) * 96, 64 * 96);
           const nextChar = this.sampleToken(lastLogits, inferStore.temperature);
 
           // Send token back to Stage 0
@@ -251,34 +270,28 @@ export class DistributedInference {
             if (dc && dc.readyState === 'open') {
               const tokenTensor = new Float32Array([nextChar.charCodeAt(0)]);
               this.peerManager.sendTensor(stage0Device.socketId, 0, tokenTensor);
-              console.log(`[DistributedInference] Stage ${myStageIndex} (last): sent token '${nextChar}' back to Stage 0`);
+              console.log(`[DistributedInference] Last stage sent token '${nextChar === '\n' ? '\\n' : nextChar}' back to Stage 0`);
             } else {
-              // Fallback: send token back through predecessor DataChannel (bidirectional)
-              console.warn(`[DistributedInference] No direct DC to Stage 0 — cannot return token`);
+              console.warn(`[DistributedInference] No open DC to Stage 0 — token lost`);
             }
           }
         } else {
-          // Forward activation to next stage
+          // Forward activation to next pipeline stage device
           const nextDevice = devices.find(d => d.stageIndex === myStageIndex + 1);
-          if (!nextDevice) {
-            console.error(`[DistributedInference] Stage ${myStageIndex}: No device for stage ${myStageIndex + 1}`);
-            continue;
-          }
-          if (!this.peerManager) continue;
+          if (!nextDevice || !this.peerManager) continue;
 
           const dc = this.peerManager.getDataChannel(nextDevice.socketId);
           if (!dc || dc.readyState !== 'open') {
-            console.error(`[DistributedInference] Stage ${myStageIndex}: DC to stage ${myStageIndex + 1} not open`);
+            console.error(`[DistributedInference] Stage ${myStageIndex}: DC to stage ${myStageIndex + 1} not open (${dc?.readyState ?? 'missing'})`);
             continue;
           }
-          this.peerManager.sendTensor(nextDevice.socketId, myStageIndex + 1, output);
-          console.log(`[DistributedInference] Stage ${myStageIndex}: forwarded activation to Stage ${myStageIndex + 1}`);
+          this.peerManager.sendTensor(nextDevice.socketId, myStageIndex + 1, activation);
+          console.log(`[DistributedInference] Stage ${myStageIndex}: forwarded to Stage ${myStageIndex + 1}`);
         }
       } catch (err) {
         if (this.cancelled) break;
-        // Timeout or processing error — log and continue listening for next tensor
         console.error(`[DistributedInference] Stage ${myStageIndex} worker error:`, err);
-        break; // Exit worker loop on timeout
+        break;
       }
     }
 
