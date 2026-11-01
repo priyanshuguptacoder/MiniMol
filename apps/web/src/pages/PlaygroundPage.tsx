@@ -28,6 +28,7 @@ import { loadStage, isStageLoaded, getLoadedStageIndices } from '../services/Inf
 
 let peerManager: PeerManager | null = null;
 let distributedInference: DistributedInference | null = null;
+let playgroundTensorUnsub: (() => void) | null = null;
 
 export default function PlaygroundPage() {
   const [prompt, setPrompt] = useState('to be or not to be that is');
@@ -99,6 +100,13 @@ export default function PlaygroundPage() {
   const handleStart = async () => {
     if (!prompt.trim()) return;
 
+    // Cancel any previous run
+    distributedInference?.cancel();
+    if (playgroundTensorUnsub) {
+      playgroundTensorUnsub();
+      playgroundTensorUnsub = null;
+    }
+
     if (!isSingleDevice && session.sessionId) {
       const pm = getPeerManager() || initPeerManager({
         sessionId: session.sessionId,
@@ -112,22 +120,13 @@ export default function PlaygroundPage() {
         },
       });
 
-      pm.onTensor((stageIndex, tensor) => {
-        distributedInference?.onTensorReceived(stageIndex, tensor);
-      });
-
       peerManager = pm;
       distributedInference = new DistributedInference(peerManager);
 
-      // Verify connection to next device in pipeline
-      const myIdx = session.myStageIndex;
-      const nextDevice = session.devices.find(d => d.stageIndex === myIdx + 1);
-      if (nextDevice && nextDevice.deviceId !== session.myDeviceId) {
-        const existing = pm.getConnection(nextDevice.deviceId);
-        if (!existing || existing.connectionState !== 'connected') {
-          await pm.initiateConnection(nextDevice.deviceId, 'successor');
-        }
-      }
+      // Register tensor listener (only once, remove previous)
+      playgroundTensorUnsub = pm.onTensor((stageIndex, tensor) => {
+        distributedInference?.onTensorReceived(stageIndex, tensor);
+      });
     } else {
       // Standalone single-device mode
       distributedInference = new DistributedInference(null);

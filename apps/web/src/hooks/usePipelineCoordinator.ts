@@ -5,12 +5,15 @@ import { useSettingsStore } from '../stores/useSettingsStore';
 import { useNetworkStore } from '../stores/useNetworkStore';
 import { signalingClient } from '../services/SignalingClient';
 import { initPeerManager, getPeerManager, disposePeerManager } from '../services/PeerManager';
+import { DistributedInference } from '../services/DistributedInference';
 
 export function usePipelineCoordinator() {
   const session = useSessionStore();
   const settings = useSettingsStore();
   const network = useNetworkStore();
   const connectingPeers = useRef<Set<string>>(new Set());
+  // Track active stage worker so we don't start multiple
+  const activeWorkerRef = useRef<DistributedInference | null>(null);
 
   // 1. Maintain active PeerManager lifecycle while session is active
   useEffect(() => {
@@ -29,6 +32,8 @@ export function usePipelineCoordinator() {
       turnCredential: settings.turnCredential || undefined,
       onTensorReceived: (stageIndex, tensor) => {
         console.log(`[PipelineCoordinator] Tensor received for stage ${stageIndex}: ${tensor.byteLength} bytes`);
+        // Route to active worker if running
+        activeWorkerRef.current?.onTensorReceived(stageIndex, tensor);
       },
     });
 
@@ -91,7 +96,64 @@ export function usePipelineCoordinator() {
     return () => unsubs.forEach(fn => fn());
   }, [session.sessionId]);
 
-  // 3. Automate deterministic adjacent pipeline negotiation: Stage k connects to Stage k + 1
+  // 3. Listen for inferenceStart → launch stage worker on non-host devices (Stage 1+)
+  useEffect(() => {
+    if (!session.sessionId) return;
+
+    const unsub = signalingClient.on<{ prompt: string; startedAt: number }>('inferenceStart', async ({ prompt }) => {
+      const sessionState = useSessionStore.getState();
+      const { myStageIndex } = sessionState;
+
+      // Only non-stage-0 devices run as workers
+      if (myStageIndex === 0) {
+        console.log('[PipelineCoordinator] inferenceStart received on Stage 0 — ignoring (host handles its own run)');
+        return;
+      }
+
+      const pm = getPeerManager();
+      if (!pm) {
+        console.warn('[PipelineCoordinator] inferenceStart received but no PeerManager available');
+        return;
+      }
+
+      // Cancel any previously running worker
+      if (activeWorkerRef.current) {
+        console.log(`[PipelineCoordinator] Cancelling existing Stage ${myStageIndex} worker before starting new one`);
+        activeWorkerRef.current.cancel();
+        activeWorkerRef.current = null;
+      }
+
+      console.log(`[PipelineCoordinator] inferenceStart → launching Stage ${myStageIndex} worker for: "${prompt.slice(0, 40)}..."`);
+
+      const worker = new DistributedInference(pm);
+      activeWorkerRef.current = worker;
+
+      // Wire PeerManager tensor events to this worker instance
+      const unsubTensor = pm.onTensor((stageIndex, tensor) => {
+        worker.onTensorReceived(stageIndex, tensor);
+      });
+
+      try {
+        await worker.run(prompt);
+      } catch (err) {
+        console.error(`[PipelineCoordinator] Stage ${myStageIndex} worker error:`, err);
+      } finally {
+        unsubTensor();
+        if (activeWorkerRef.current === worker) {
+          activeWorkerRef.current = null;
+        }
+        console.log(`[PipelineCoordinator] Stage ${myStageIndex} worker finished`);
+      }
+    });
+
+    return () => {
+      unsub();
+      activeWorkerRef.current?.cancel();
+      activeWorkerRef.current = null;
+    };
+  }, [session.sessionId, session.myStageIndex]);
+
+  // 4. Automate deterministic adjacent pipeline negotiation: Stage k connects to Stage k + 1
   useEffect(() => {
     const { sessionId, myDeviceId, myStageIndex, devices } = session;
     if (!sessionId || !myDeviceId || devices.length < 2) return;
